@@ -7,44 +7,40 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
 use Psr\Log\LoggerInterface;
+use Throwable;
+use JsonException;
 
 final class NotificationManager
 {
-    protected Config $config;
-    protected LoggerInterface $logger;
-    protected array $throttleCache = [];
+    private const NOTIFICATION_DISABLED = 0;
+    private const DEFAULT_THROTTLE_MINUTES = 15;
+    private const HTTP_TIMEOUT = 10;
+    private const CACHE_PREFIX = 'smart_failover_throttle_';
 
-    public function __construct(Config $config, LoggerInterface $logger)
-    {
-        $this->config = $config;
-        $this->logger = $logger;
+    public function __construct(
+        private readonly Config $config,
+        private readonly LoggerInterface $logger
+    ) {
     }
 
     /**
      * Notify about service failure.
      */
-    public function notifyFailure(\Exception $exception, array $context = []): void
+    public function notifyFailure(Throwable $exception, array $context = []): void
     {
-        if (!$this->config->get('smart-failover.notifications.enabled', false)) {
+        if (!$this->isNotificationsEnabled()) {
             return;
         }
 
         $message = $this->formatFailureMessage($exception, $context);
         $throttleKey = $this->getThrottleKey($exception);
 
-        // Check throttling
         if ($this->isThrottled($throttleKey)) {
-            $this->logger->debug('Notification throttled', [
-                'throttle_key' => $throttleKey,
-                'exception' => $exception->getMessage(),
-            ]);
+            $this->logThrottledNotification($throttleKey, $exception);
             return;
         }
 
-        // Send notifications
         $this->sendNotifications($message, $context);
-
-        // Set throttle
         $this->setThrottle($throttleKey);
     }
 
@@ -53,154 +49,170 @@ final class NotificationManager
      */
     public function notifyRecovery(string $service, array $context = []): void
     {
-        if (!$this->config->get('smart-failover.notifications.enabled', false)) {
+        if (!$this->isNotificationsEnabled()) {
             return;
         }
 
         $message = $this->formatRecoveryMessage($service, $context);
-
-        // Send notifications
         $this->sendNotifications($message, $context, 'recovery');
+    }
+
+    /**
+     * Check if notifications are enabled.
+     */
+    private function isNotificationsEnabled(): bool
+    {
+        return (bool) $this->config->get('smart-failover.notifications.enabled', false);
     }
 
     /**
      * Send notifications to all enabled channels.
      */
-    protected function sendNotifications(array $message, array $context = [], string $type = 'failure'): void
+    private function sendNotifications(array $message, array $context = [], string $type = 'failure'): void
     {
         $channels = $this->config->get('smart-failover.notifications.channels', []);
 
-        // Send Slack notification
-        if ($channels['slack']['enabled'] ?? false) {
-            $this->sendSlackNotification($message, $context, $type);
+        foreach ($this->getEnabledChannels($channels) as $channel => $config) {
+            match ($channel) {
+                'slack' => $this->sendSlackNotification($message, $config, $type),
+                'telegram' => $this->sendTelegramNotification($message, $config, $type),
+                'email' => $this->sendEmailNotification($message, $config, $type),
+                default => null,
+            };
         }
+    }
 
-        // Send Telegram notification
-        if ($channels['telegram']['enabled'] ?? false) {
-            $this->sendTelegramNotification($message, $context, $type);
-        }
-
-        // Send email notification
-        if ($channels['email']['enabled'] ?? false) {
-            $this->sendEmailNotification($message, $context, $type);
-        }
+    /**
+     * Get enabled notification channels.
+     */
+    private function getEnabledChannels(array $channels): array
+    {
+        return array_filter($channels, fn($config) => $config['enabled'] ?? false);
     }
 
     /**
      * Send Slack notification.
      */
-    protected function sendSlackNotification(array $message, array $context = [], string $type = 'failure'): void
+    private function sendSlackNotification(array $message, array $config, string $type): void
     {
+        $webhookUrl = $config['webhook_url'] ?? null;
+
+        if (!$webhookUrl) {
+            $this->logger->warning('Slack webhook URL not configured');
+            return;
+        }
+
         try {
-            $slackConfig = $this->config->get('smart-failover.notifications.channels.slack');
-            $webhookUrl = $slackConfig['webhook_url'] ?? null;
-
-            if (!$webhookUrl) {
-                $this->logger->warning('Slack webhook URL not configured');
-                return;
-            }
-
-            $color = $type === 'failure' ? 'danger' : 'good';
-            $emoji = $type === 'failure' ? ':warning:' : ':white_check_mark:';
-
-            $payload = [
-                'channel' => $slackConfig['channel'] ?? '#alerts',
-                'username' => $slackConfig['username'] ?? 'SmartFailover',
-                'icon_emoji' => $emoji,
-                'attachments' => [
-                    [
-                        'color' => $color,
-                        'title' => $message['title'],
-                        'text' => $message['description'],
-                        'fields' => [
-                            [
-                                'title' => 'Service',
-                                'value' => $message['service'] ?? 'Unknown',
-                                'short' => true,
-                            ],
-                            [
-                                'title' => 'Timestamp',
-                                'value' => $message['timestamp'],
-                                'short' => true,
-                            ],
-                        ],
-                        'footer' => 'SmartFailover',
-                        'ts' => time(),
-                    ],
-                ],
-            ];
-
-            Http::timeout(10)->post($webhookUrl, $payload);
+            $payload = $this->buildSlackPayload($message, $config, $type);
+            
+            Http::timeout(self::HTTP_TIMEOUT)
+                ->post($webhookUrl, $payload);
 
             $this->logger->info('Slack notification sent', [
                 'type' => $type,
-                'channel' => $slackConfig['channel'],
+                'channel' => $config['channel'] ?? '#alerts',
             ]);
-        } catch (\Exception $e) {
-            $this->logger->error('Failed to send Slack notification', [
-                'error' => $e->getMessage(),
-            ]);
+        } catch (Throwable $e) {
+            $this->logNotificationError('Slack', $e);
         }
+    }
+
+    /**
+     * Build Slack notification payload.
+     */
+    private function buildSlackPayload(array $message, array $config, string $type): array
+    {
+        [$color, $emoji] = $this->getNotificationStyle($type);
+
+        return [
+            'channel' => $config['channel'] ?? '#alerts',
+            'username' => $config['username'] ?? 'SmartFailover',
+            'icon_emoji' => $emoji,
+            'attachments' => [
+                [
+                    'color' => $color,
+                    'title' => $message['title'],
+                    'text' => $message['description'],
+                    'fields' => [
+                        [
+                            'title' => 'Service',
+                            'value' => $message['service'] ?? 'Unknown',
+                            'short' => true,
+                        ],
+                        [
+                            'title' => 'Timestamp',
+                            'value' => $message['timestamp'],
+                            'short' => true,
+                        ],
+                    ],
+                    'footer' => 'SmartFailover',
+                    'ts' => time(),
+                ],
+            ],
+        ];
     }
 
     /**
      * Send Telegram notification.
      */
-    protected function sendTelegramNotification(array $message, array $context = [], string $type = 'failure'): void
+    private function sendTelegramNotification(array $message, array $config, string $type): void
     {
+        $botToken = $config['bot_token'] ?? null;
+        $chatId = $config['chat_id'] ?? null;
+
+        if (!$botToken || !$chatId) {
+            $this->logger->warning('Telegram bot token or chat ID not configured');
+            return;
+        }
+
         try {
-            $telegramConfig = $this->config->get('smart-failover.notifications.channels.telegram');
-            $botToken = $telegramConfig['bot_token'] ?? null;
-            $chatId = $telegramConfig['chat_id'] ?? null;
-
-            if (!$botToken || !$chatId) {
-                $this->logger->warning('Telegram bot token or chat ID not configured');
-                return;
-            }
-
-            $emoji = $type === 'failure' ? '⚠️' : '✅';
-            $text = "{$emoji} *{$message['title']}*\n\n";
-            $text .= "{$message['description']}\n\n";
-            $text .= "*Service:* {$message['service']}\n";
-            $text .= "*Time:* {$message['timestamp']}";
-
+            $text = $this->buildTelegramMessage($message, $type);
             $url = "https://api.telegram.org/bot{$botToken}/sendMessage";
 
-            Http::timeout(10)->post($url, [
-                'chat_id' => $chatId,
-                'text' => $text,
-                'parse_mode' => 'Markdown',
-            ]);
+            Http::timeout(self::HTTP_TIMEOUT)
+                ->post($url, [
+                    'chat_id' => $chatId,
+                    'text' => $text,
+                    'parse_mode' => 'Markdown',
+                ]);
 
             $this->logger->info('Telegram notification sent', [
                 'type' => $type,
                 'chat_id' => $chatId,
             ]);
-        } catch (\Exception $e) {
-            $this->logger->error('Failed to send Telegram notification', [
-                'error' => $e->getMessage(),
-            ]);
+        } catch (Throwable $e) {
+            $this->logNotificationError('Telegram', $e);
         }
+    }
+
+    /**
+     * Build Telegram message text.
+     */
+    private function buildTelegramMessage(array $message, string $type): string
+    {
+        $emoji = $type === 'failure' ? '⚠️' : '✅';
+        
+        return "{$emoji} *{$message['title']}*\n\n" .
+               "{$message['description']}\n\n" .
+               "*Service:* {$message['service']}\n" .
+               "*Time:* {$message['timestamp']}";
     }
 
     /**
      * Send email notification.
      */
-    protected function sendEmailNotification(array $message, array $context = [], string $type = 'failure'): void
+    private function sendEmailNotification(array $message, array $config, string $type): void
     {
+        $to = $config['to'] ?? null;
+
+        if (!$to) {
+            $this->logger->warning('Email notification recipient not configured');
+            return;
+        }
+
         try {
-            $emailConfig = $this->config->get('smart-failover.notifications.channels.email');
-            $to = $emailConfig['to'] ?? null;
-            $from = $emailConfig['from'] ?? 'noreply@example.com';
-
-            if (!$to) {
-                $this->logger->warning('Email notification recipient not configured');
-                return;
-            }
-
-            $subject = $type === 'failure'
-                ? "SmartFailover Alert: {$message['title']}"
-                : "SmartFailover Recovery: {$message['title']}";
+            $subject = $this->buildEmailSubject($message, $type);
+            $from = $config['from'] ?? 'noreply@example.com';
 
             Mail::raw($message['description'], function ($mail) use ($to, $from, $subject) {
                 $mail->to($to)
@@ -212,24 +224,45 @@ final class NotificationManager
                 'type' => $type,
                 'to' => $to,
             ]);
-        } catch (\Exception $e) {
-            $this->logger->error('Failed to send email notification', [
-                'error' => $e->getMessage(),
-            ]);
+        } catch (Throwable $e) {
+            $this->logNotificationError('Email', $e);
         }
+    }
+
+    /**
+     * Build email subject.
+     */
+    private function buildEmailSubject(array $message, string $type): string
+    {
+        $prefix = $type === 'failure' ? 'SmartFailover Alert' : 'SmartFailover Recovery';
+        return "{$prefix}: {$message['title']}";
+    }
+
+    /**
+     * Get notification style based on type.
+     */
+    private function getNotificationStyle(string $type): array
+    {
+        return match ($type) {
+            'failure' => ['danger', ':warning:'],
+            'recovery' => ['good', ':white_check_mark:'],
+            default => ['#36a64f', ':information_source:']
+        };
     }
 
     /**
      * Format failure message.
      */
-    protected function formatFailureMessage(\Exception $exception, array $context = []): array
+    private function formatFailureMessage(Throwable $exception, array $context = []): array
     {
+        $contextJson = $this->formatContext($context);
+
         return [
             'title' => 'Service Failure Detected',
             'description' => "A service failure has been detected:\n\n" .
                            "Error: {$exception->getMessage()}\n" .
                            "File: {$exception->getFile()}:{$exception->getLine()}\n" .
-                           (!empty($context) ? 'Context: ' . json_encode($context, JSON_PRETTY_PRINT) : ''),
+                           $contextJson,
             'service' => $context['service'] ?? 'Unknown',
             'timestamp' => now()->toISOString(),
             'severity' => 'high',
@@ -239,13 +272,15 @@ final class NotificationManager
     /**
      * Format recovery message.
      */
-    protected function formatRecoveryMessage(string $service, array $context = []): array
+    private function formatRecoveryMessage(string $service, array $context = []): array
     {
+        $contextJson = $this->formatContext($context);
+
         return [
             'title' => 'Service Recovery',
             'description' => "Service has recovered and is now operational:\n\n" .
                            "Service: {$service}\n" .
-                           (!empty($context) ? 'Details: ' . json_encode($context, JSON_PRETTY_PRINT) : ''),
+                           $contextJson,
             'service' => $service,
             'timestamp' => now()->toISOString(),
             'severity' => 'info',
@@ -253,19 +288,36 @@ final class NotificationManager
     }
 
     /**
+     * Format context data for messages.
+     */
+    private function formatContext(array $context): string
+    {
+        if (empty($context)) {
+            return '';
+        }
+
+        try {
+            return 'Context: ' . json_encode($context, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT);
+        } catch (JsonException) {
+            return 'Context: [Unable to encode context data]';
+        }
+    }
+
+    /**
      * Get throttle key for exception.
      */
-    protected function getThrottleKey(\Exception $exception): string
+    private function getThrottleKey(Throwable $exception): string
     {
-        return 'smart_failover_throttle_' . md5($exception->getMessage() . $exception->getFile() . $exception->getLine());
+        $keyData = $exception->getMessage() . $exception->getFile() . $exception->getLine();
+        return self::CACHE_PREFIX . md5($keyData);
     }
 
     /**
      * Check if notification is throttled.
      */
-    protected function isThrottled(string $throttleKey): bool
+    private function isThrottled(string $throttleKey): bool
     {
-        if (!$this->config->get('smart-failover.notifications.throttle.enabled', true)) {
+        if (!$this->isThrottlingEnabled()) {
             return false;
         }
 
@@ -273,15 +325,44 @@ final class NotificationManager
     }
 
     /**
+     * Check if throttling is enabled.
+     */
+    private function isThrottlingEnabled(): bool
+    {
+        return (bool) $this->config->get('smart-failover.notifications.throttle.enabled', true);
+    }
+
+    /**
      * Set throttle for notification.
      */
-    protected function setThrottle(string $throttleKey): void
+    private function setThrottle(string $throttleKey): void
     {
-        if (!$this->config->get('smart-failover.notifications.throttle.enabled', true)) {
+        if (!$this->isThrottlingEnabled()) {
             return;
         }
 
-        $minutes = $this->config->get('smart-failover.notifications.throttle.minutes', 15);
+        $minutes = $this->config->get('smart-failover.notifications.throttle.minutes', self::DEFAULT_THROTTLE_MINUTES);
         Cache::put($throttleKey, true, now()->addMinutes($minutes));
+    }
+
+    /**
+     * Log throttled notification.
+     */
+    private function logThrottledNotification(string $throttleKey, Throwable $exception): void
+    {
+        $this->logger->debug('Notification throttled', [
+            'throttle_key' => $throttleKey,
+            'exception' => $exception->getMessage(),
+        ]);
+    }
+
+    /**
+     * Log notification error.
+     */
+    private function logNotificationError(string $channel, Throwable $e): void
+    {
+        $this->logger->error("Failed to send {$channel} notification", [
+            'error' => $e->getMessage(),
+        ]);
     }
 }
