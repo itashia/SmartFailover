@@ -4,27 +4,26 @@ namespace Mirzaaghazadeh\SmartFailover\Services;
 
 use Exception;
 use Illuminate\Contracts\Config\Repository as Config;
+use Illuminate\Contracts\Filesystem\Cloud;
 use Illuminate\Filesystem\FilesystemManager;
 use Illuminate\Support\Facades\Storage;
 use Psr\Log\LoggerInterface;
+use Throwable;
 
 final class StorageFailoverManager
 {
-    protected Config $config;
-    protected LoggerInterface $logger;
-    protected FilesystemManager $storageManager;
-    protected array $disks = [];
-    protected ?string $primaryDisk = null;
-    protected array $fallbackDisks = [];
-    protected array $healthStatus = [];
-    protected int $retryAttempts = 3;
-    protected int $retryDelay = 1000; // milliseconds
+    private const DEFAULT_RETRY_ATTEMPTS = 3;
+    private const DEFAULT_RETRY_DELAY_MS = 1000;
+    private const HEALTH_STATUS_HEALTHY = 'healthy';
+    private const HEALTH_STATUS_UNHEALTHY = 'unhealthy';
+    private const HEALTH_CHECK_TTL = 300; // 5 minutes
+    private const HEALTH_CHECK_FILE_PREFIX = 'smart_failover_health_check_';
 
-    public function __construct(Config $config, LoggerInterface $logger, FilesystemManager $storageManager)
-    {
-        $this->config = $config;
-        $this->logger = $logger;
-        $this->storageManager = $storageManager;
+    public function __construct(
+        private readonly Config $config,
+        private readonly LoggerInterface $logger,
+        private readonly FilesystemManager $storageManager
+    ) {
         $this->loadConfiguration();
     }
 
@@ -35,7 +34,7 @@ final class StorageFailoverManager
     {
         $this->primaryDisk = $primary;
         $this->fallbackDisks = $fallbacks;
-        $this->disks = array_merge([$primary], $fallbacks);
+        $this->disks = [$primary, ...$fallbacks];
 
         return $this;
     }
@@ -43,27 +42,22 @@ final class StorageFailoverManager
     /**
      * Store file with failover protection.
      */
-    public function put(string $path, $contents, array $options = []): bool
+    public function put(string $path, mixed $contents, array $options = []): bool
     {
-        $disks = $this->getAvailableDisks();
-
-        foreach ($disks as $diskName) {
+        foreach ($this->getAvailableDisks() as $diskName) {
             try {
                 $this->logger->info("Attempting to store file on {$diskName}");
 
-                $disk = $this->storageManager->disk($diskName);
-                $result = $disk->put($path, $contents, $options);
+                $result = $this->storageManager->disk($diskName)
+                    ->put($path, $contents, $options);
 
                 $this->markDiskHealthy($diskName);
                 $this->logger->info("File stored successfully on {$diskName}");
 
                 return $result;
 
-            } catch (Exception $e) {
-                $this->markDiskUnhealthy($diskName, $e->getMessage());
-                $this->logger->error("Storage failed on {$diskName}: " . $e->getMessage());
-
-                // Continue to next disk
+            } catch (Throwable $e) {
+                $this->handleDiskError($diskName, $e, 'Storage failed');
                 continue;
             }
         }
@@ -77,9 +71,7 @@ final class StorageFailoverManager
      */
     public function get(string $path): ?string
     {
-        $disks = $this->getAvailableDisks();
-
-        foreach ($disks as $diskName) {
+        foreach ($this->getAvailableDisks() as $diskName) {
             try {
                 $this->logger->info("Attempting to get file from {$diskName}");
 
@@ -93,11 +85,8 @@ final class StorageFailoverManager
                     return $contents;
                 }
 
-            } catch (Exception $e) {
-                $this->markDiskUnhealthy($diskName, $e->getMessage());
-                $this->logger->error("Storage retrieval failed on {$diskName}: " . $e->getMessage());
-
-                // Continue to next disk
+            } catch (Throwable $e) {
+                $this->handleDiskError($diskName, $e, 'Storage retrieval failed');
                 continue;
             }
         }
@@ -111,28 +100,23 @@ final class StorageFailoverManager
      */
     public function delete(string $path): bool
     {
-        $disks = $this->getAvailableDisks();
         $success = false;
 
-        foreach ($disks as $diskName) {
+        foreach ($this->getAvailableDisks() as $diskName) {
             try {
                 $this->logger->info("Attempting to delete file from {$diskName}");
 
                 $disk = $this->storageManager->disk($diskName);
 
-                if ($disk->exists($path)) {
-                    $result = $disk->delete($path);
-                    if ($result) {
-                        $success = true;
-                        $this->logger->info("File deleted successfully from {$diskName}");
-                    }
+                if ($disk->exists($path) && $disk->delete($path)) {
+                    $success = true;
+                    $this->logger->info("File deleted successfully from {$diskName}");
                 }
 
                 $this->markDiskHealthy($diskName);
 
-            } catch (Exception $e) {
-                $this->markDiskUnhealthy($diskName, $e->getMessage());
-                $this->logger->error("Storage deletion failed on {$diskName}: " . $e->getMessage());
+            } catch (Throwable $e) {
+                $this->handleDiskError($diskName, $e, 'Storage deletion failed');
             }
         }
 
@@ -144,9 +128,7 @@ final class StorageFailoverManager
      */
     public function exists(string $path): bool
     {
-        $disks = $this->getAvailableDisks();
-
-        foreach ($disks as $diskName) {
+        foreach ($this->getAvailableDisks() as $diskName) {
             try {
                 $disk = $this->storageManager->disk($diskName);
 
@@ -155,9 +137,8 @@ final class StorageFailoverManager
                     return true;
                 }
 
-            } catch (Exception $e) {
-                $this->markDiskUnhealthy($diskName, $e->getMessage());
-                $this->logger->error("Storage check failed on {$diskName}: " . $e->getMessage());
+            } catch (Throwable $e) {
+                $this->handleDiskError($diskName, $e, 'Storage check failed');
             }
         }
 
@@ -169,23 +150,21 @@ final class StorageFailoverManager
      */
     public function url(string $path): ?string
     {
-        $disks = $this->getAvailableDisks();
-
-        foreach ($disks as $diskName) {
+        foreach ($this->getAvailableDisks() as $diskName) {
             try {
                 $disk = $this->storageManager->disk($diskName);
 
                 if ($disk->exists($path)) {
-                    /** @var \Illuminate\Contracts\Filesystem\Cloud $cloudDisk */
-                    $cloudDisk = $disk;
-                    $url = $cloudDisk->url($path);
+                    $url = $disk instanceof Cloud 
+                        ? $disk->url($path)
+                        : null;
+                    
                     $this->markDiskHealthy($diskName);
                     return $url;
                 }
 
-            } catch (Exception $e) {
-                $this->markDiskUnhealthy($diskName, $e->getMessage());
-                $this->logger->error("Storage URL generation failed on {$diskName}: " . $e->getMessage());
+            } catch (Throwable $e) {
+                $this->handleDiskError($diskName, $e, 'Storage URL generation failed');
             }
         }
 
@@ -209,45 +188,28 @@ final class StorageFailoverManager
     /**
      * Check health of a specific disk.
      */
-    protected function checkDiskHealth(string $diskName): array
+    private function checkDiskHealth(string $diskName): array
     {
         $startTime = microtime(true);
 
         try {
             $disk = $this->storageManager->disk($diskName);
+            $this->performHealthCheck($disk, $diskName);
 
-            // Test basic operations
-            $testFile = 'health-check-' . time() . '.txt';
-            $testContent = 'SmartFailover health check';
-
-            // Test write
-            $disk->put($testFile, $testContent);
-
-            // Test read
-            $retrievedContent = $disk->get($testFile);
-
-            // Test delete
-            $disk->delete($testFile);
-
-            // Verify content matches
-            if ($retrievedContent !== $testContent) {
-                throw new Exception('Content verification failed');
-            }
-
-            $responseTime = round(((float) microtime(true) - (float) $startTime) * 1000.0, 2);
+            $responseTime = $this->calculateResponseTime($startTime);
 
             return [
-                'status' => 'healthy',
+                'status' => self::HEALTH_STATUS_HEALTHY,
                 'response_time' => $responseTime,
-                'driver' => $this->config->get("filesystems.disks.{$diskName}.driver", 'unknown'),
+                'driver' => $this->getDiskDriver($diskName),
                 'last_checked' => now()->toISOString(),
             ];
 
-        } catch (Exception $e) {
-            $responseTime = round(((float) microtime(true) - (float) $startTime) * 1000.0, 2);
+        } catch (Throwable $e) {
+            $responseTime = $this->calculateResponseTime($startTime);
 
             return [
-                'status' => 'unhealthy',
+                'status' => self::HEALTH_STATUS_UNHEALTHY,
                 'response_time' => $responseTime,
                 'error' => $e->getMessage(),
                 'last_checked' => now()->toISOString(),
@@ -256,9 +218,52 @@ final class StorageFailoverManager
     }
 
     /**
+     * Perform health check operations on disk.
+     */
+    private function performHealthCheck($disk, string $diskName): void
+    {
+        $testFile = self::HEALTH_CHECK_FILE_PREFIX . time() . '.txt';
+        $testContent = 'SmartFailover health check';
+
+        // Test write, read, and delete operations
+        $disk->put($testFile, $testContent);
+        $retrievedContent = $disk->get($testFile);
+        $disk->delete($testFile);
+
+        if ($retrievedContent !== $testContent) {
+            throw new Exception('Content verification failed');
+        }
+    }
+
+    /**
+     * Calculate response time in milliseconds.
+     */
+    private function calculateResponseTime(float $startTime): float
+    {
+        return round((microtime(true) - $startTime) * 1000.0, 2);
+    }
+
+    /**
+     * Get disk driver from configuration.
+     */
+    private function getDiskDriver(string $diskName): string
+    {
+        return $this->config->get("filesystems.disks.{$diskName}.driver", 'unknown');
+    }
+
+    /**
+     * Handle disk error with consistent logging and marking.
+     */
+    private function handleDiskError(string $diskName, Throwable $e, string $context): void
+    {
+        $this->markDiskUnhealthy($diskName, $e->getMessage());
+        $this->logger->error("{$context} on {$diskName}: " . $e->getMessage());
+    }
+
+    /**
      * Get available disks in priority order.
      */
-    protected function getAvailableDisks(): array
+    private function getAvailableDisks(): array
     {
         $available = [];
 
@@ -274,18 +279,14 @@ final class StorageFailoverManager
             }
         }
 
-        // If no healthy disks, try all configured disks
-        if (empty($available)) {
-            $available = $this->disks;
-        }
-
-        return $available;
+        // If no healthy disks, try all configured disks as last resort
+        return empty($available) ? $this->disks : $available;
     }
 
     /**
      * Check if disk is healthy.
      */
-    protected function isDiskHealthy(string $diskName): bool
+    private function isDiskHealthy(string $diskName): bool
     {
         if (!isset($this->healthStatus[$diskName])) {
             return true; // Assume healthy if not checked yet
@@ -293,22 +294,21 @@ final class StorageFailoverManager
 
         $status = $this->healthStatus[$diskName];
 
-        // Consider unhealthy if last failure was recent (within 5 minutes)
-        if ($status['status'] === 'unhealthy') {
+        if ($status['status'] === self::HEALTH_STATUS_UNHEALTHY) {
             $lastFailure = $status['last_failure'] ?? 0;
-            return (time() - $lastFailure) > 300; // 5 minutes
+            return (time() - $lastFailure) > self::HEALTH_CHECK_TTL;
         }
 
-        return $status['status'] === 'healthy';
+        return $status['status'] === self::HEALTH_STATUS_HEALTHY;
     }
 
     /**
      * Mark disk as healthy.
      */
-    protected function markDiskHealthy(string $diskName): void
+    private function markDiskHealthy(string $diskName): void
     {
         $this->healthStatus[$diskName] = [
-            'status' => 'healthy',
+            'status' => self::HEALTH_STATUS_HEALTHY,
             'last_success' => time(),
         ];
     }
@@ -316,10 +316,10 @@ final class StorageFailoverManager
     /**
      * Mark disk as unhealthy.
      */
-    protected function markDiskUnhealthy(string $diskName, string $error): void
+    private function markDiskUnhealthy(string $diskName, string $error): void
     {
         $this->healthStatus[$diskName] = [
-            'status' => 'unhealthy',
+            'status' => self::HEALTH_STATUS_UNHEALTHY,
             'last_failure' => time(),
             'error' => $error,
         ];
@@ -328,30 +328,19 @@ final class StorageFailoverManager
     /**
      * Load configuration.
      */
-    protected function loadConfiguration(): void
+    private function loadConfiguration(): void
     {
         $config = $this->config->get('smart-failover.storage', []);
 
-        if (isset($config['primary'])) {
-            $this->primaryDisk = $config['primary'];
-        }
+        $this->primaryDisk = $config['primary'] ?? null;
+        $this->fallbackDisks = $config['fallbacks'] ?? [];
+        $this->retryAttempts = $config['retry_attempts'] ?? self::DEFAULT_RETRY_ATTEMPTS;
+        $this->retryDelay = $config['retry_delay'] ?? self::DEFAULT_RETRY_DELAY_MS;
 
-        if (isset($config['fallbacks'])) {
-            $this->fallbackDisks = $config['fallbacks'];
-        }
-
-        if (isset($config['retry_attempts'])) {
-            $this->retryAttempts = $config['retry_attempts'];
-        }
-
-        if (isset($config['retry_delay'])) {
-            $this->retryDelay = $config['retry_delay'];
-        }
-
-        $this->disks = array_merge(
-            $this->primaryDisk ? [$this->primaryDisk] : [],
-            $this->fallbackDisks
-        );
+        $this->disks = array_filter([
+            $this->primaryDisk,
+            ...$this->fallbackDisks
+        ]);
     }
 
     /**
@@ -370,7 +359,7 @@ final class StorageFailoverManager
     /**
      * Sync file across all available disks.
      */
-    public function sync(string $path, $contents = null): array
+    public function sync(string $path, mixed $contents = null): array
     {
         $results = [];
         $disks = $this->getAvailableDisks();
@@ -379,27 +368,61 @@ final class StorageFailoverManager
         if ($contents === null && $this->primaryDisk) {
             try {
                 $contents = $this->storageManager->disk($this->primaryDisk)->get($path);
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 throw new Exception('Could not retrieve file for syncing: ' . $e->getMessage());
             }
         }
 
+        if ($contents === null) {
+            throw new Exception('No contents provided for syncing');
+        }
+
         foreach ($disks as $diskName) {
             try {
-                $disk = $this->storageManager->disk($diskName);
-                $result = $disk->put($path, $contents);
+                $result = $this->storageManager->disk($diskName)
+                    ->put($path, $contents);
+                
                 $results[$diskName] = $result ? 'success' : 'failed';
 
                 if ($result) {
                     $this->markDiskHealthy($diskName);
                 }
 
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 $results[$diskName] = 'error: ' . $e->getMessage();
                 $this->markDiskUnhealthy($diskName, $e->getMessage());
             }
         }
 
         return $results;
+    }
+
+    /**
+     * Get disk usage statistics.
+     */
+    public function getDiskUsage(): array
+    {
+        $usage = [];
+
+        foreach ($this->disks as $diskName) {
+            try {
+                $disk = $this->storageManager->disk($diskName);
+                
+                // This is a simplified implementation - actual disk usage
+                // would depend on the filesystem driver capabilities
+                $usage[$diskName] = [
+                    'status' => $this->isDiskHealthy($diskName) ? 'healthy' : 'unhealthy',
+                    'driver' => $this->getDiskDriver($diskName),
+                ];
+
+            } catch (Throwable $e) {
+                $usage[$diskName] = [
+                    'status' => 'unhealthy',
+                    'error' => $e->getMessage(),
+                ];
+            }
+        }
+
+        return $usage;
     }
 }
