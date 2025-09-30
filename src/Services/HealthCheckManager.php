@@ -5,19 +5,21 @@ namespace Mirzaaghazadeh\SmartFailover\Services;
 use Illuminate\Contracts\Config\Repository as Config;
 use Illuminate\Support\Facades\Storage;
 use Psr\Log\LoggerInterface;
+use Exception;
+use Throwable;
 
 final class HealthCheckManager
 {
-    protected Config $config;
-    protected LoggerInterface $logger;
-    protected array $services = [];
-    protected int $timeout;
+    private const PACKAGE_VERSION = '1.0.0';
+    private const DEFAULT_TIMEOUT = 5;
+    private const HEALTH_STATUS_HEALTHY = 'healthy';
+    private const HEALTH_STATUS_UNHEALTHY = 'unhealthy';
+    private const HEALTH_STATUS_DEGRADED = 'degraded';
 
-    public function __construct(Config $config, LoggerInterface $logger)
-    {
-        $this->config = $config;
-        $this->logger = $logger;
-        $this->timeout = $config->get('smart-failover.health_check.timeout', 5);
+    public function __construct(
+        private readonly Config $config,
+        private readonly LoggerInterface $logger
+    ) {
     }
 
     /**
@@ -25,58 +27,17 @@ final class HealthCheckManager
      */
     public function checkAll(array $serviceConfigs = []): array
     {
-        $results = [
-            'status' => 'healthy',
-            'timestamp' => now()->toISOString(),
-            'services' => [],
-            'summary' => [
-                'total' => 0,
-                'healthy' => 0,
-                'unhealthy' => 0,
-            ],
-        ];
+        $results = $this->initializeResults();
+        $enabledServices = $this->getEnabledServices();
 
-        $enabledServices = $this->config->get('smart-failover.health_check.services', []);
-
-        // Check database services
-        if ($enabledServices['database'] ?? false) {
-            $databaseManager = app(DatabaseFailoverManager::class);
-            $dbResults = $databaseManager->checkHealth($serviceConfigs['database'] ?? []);
-            $results['services']['database'] = $dbResults;
+        foreach ($enabledServices as $service => $isEnabled) {
+            if ($isEnabled) {
+                $results['services'][$service] = $this->checkService($service, $serviceConfigs[$service] ?? []);
+            }
         }
 
-        // Check cache services
-        if ($enabledServices['cache'] ?? false) {
-            $cacheManager = app(CacheFailoverManager::class);
-            $cacheResults = $cacheManager->checkHealth($serviceConfigs['cache'] ?? []);
-            $results['services']['cache'] = $cacheResults;
-        }
-
-        // Check queue services
-        if ($enabledServices['queue'] ?? false) {
-            $queueManager = app(QueueFailoverManager::class);
-            $queueResults = $queueManager->checkHealth($serviceConfigs['queue'] ?? []);
-            $results['services']['queue'] = $queueResults;
-        }
-
-        // Check storage services
-        if ($enabledServices['storage'] ?? false) {
-            $results['services']['storage'] = $this->checkStorageHealth();
-        }
-
-        // Check mail services
-        if ($enabledServices['mail'] ?? false) {
-            $results['services']['mail'] = $this->checkMailHealth();
-        }
-
-        // Calculate summary
         $this->calculateSummary($results);
-
-        // Log health check results
-        $this->logger->info('Health check completed', [
-            'status' => $results['status'],
-            'summary' => $results['summary'],
-        ]);
+        $this->logHealthCheck($results);
 
         return $results;
     }
@@ -87,162 +48,17 @@ final class HealthCheckManager
     public function isServiceHealthy(string $service): bool
     {
         try {
-            switch ($service) {
-                case 'database':
-                    $manager = app(DatabaseFailoverManager::class);
-                    $status = $manager->getHealthStatus();
-                    break;
-                case 'cache':
-                    $manager = app(CacheFailoverManager::class);
-                    $status = $manager->getHealthStatus();
-                    break;
-                case 'queue':
-                    $manager = app(QueueFailoverManager::class);
-                    $status = $manager->getHealthStatus();
-                    break;
-                default:
-                    return false;
-            }
-
-            return !empty($status) && in_array(true, $status, true);
-        } catch (\Exception $e) {
+            return match ($service) {
+                'database', 'cache', 'queue' => $this->checkManagerHealth($service),
+                default => false,
+            };
+        } catch (Throwable $e) {
             $this->logger->error('Failed to check service health', [
                 'service' => $service,
                 'error' => $e->getMessage(),
             ]);
+            
             return false;
-        }
-    }
-
-    /**
-     * Check storage health.
-     */
-    protected function checkStorageHealth(): array
-    {
-        $results = [];
-        $disks = ['local', 'public'];
-
-        // Add configured disks
-        if ($this->config->has('filesystems.disks')) {
-            $configuredDisks = array_keys($this->config->get('filesystems.disks', []));
-            $disks = array_merge($disks, $configuredDisks);
-            $disks = array_unique($disks);
-        }
-
-        foreach ($disks as $disk) {
-            try {
-                $startTime = microtime(true);
-
-                // Test file operations
-                $testFile = 'smart_failover_health_check_' . time() . '.txt';
-                $testContent = 'health check test';
-
-                Storage::disk($disk)->put($testFile, $testContent);
-                $retrieved = Storage::disk($disk)->get($testFile);
-                Storage::disk($disk)->delete($testFile);
-
-                $responseTime = ((float) microtime(true) - (float) $startTime) * 1000.0;
-
-                if ($retrieved === $testContent) {
-                    $results[$disk] = [
-                        'disk' => $disk,
-                        'status' => 'healthy',
-                        'response_time_ms' => round($responseTime, 2),
-                        'checked_at' => now()->toISOString(),
-                    ];
-                } else {
-                    throw new \Exception('File content mismatch');
-                }
-            } catch (\Exception $e) {
-                $results[$disk] = [
-                    'disk' => $disk,
-                    'status' => 'unhealthy',
-                    'error' => $e->getMessage(),
-                    'checked_at' => now()->toISOString(),
-                ];
-            }
-        }
-
-        return $results;
-    }
-
-    /**
-     * Check mail health.
-     */
-    protected function checkMailHealth(): array
-    {
-        $results = [];
-        $mailers = ['smtp', 'log'];
-
-        // Add configured mailers
-        if ($this->config->has('mail.mailers')) {
-            $configuredMailers = array_keys($this->config->get('mail.mailers', []));
-            $mailers = array_merge($mailers, $configuredMailers);
-            $mailers = array_unique($mailers);
-        }
-
-        foreach ($mailers as $mailer) {
-            try {
-                $startTime = microtime(true);
-
-                // Test mailer configuration
-                $mailerConfig = $this->config->get("mail.mailers.{$mailer}");
-
-                if (!$mailerConfig) {
-                    throw new \Exception('Mailer configuration not found');
-                }
-
-                $responseTime = ((float) microtime(true) - (float) $startTime) * 1000.0;
-
-                $results[$mailer] = [
-                    'mailer' => $mailer,
-                    'status' => 'healthy',
-                    'response_time_ms' => round($responseTime, 2),
-                    'checked_at' => now()->toISOString(),
-                ];
-            } catch (\Exception $e) {
-                $results[$mailer] = [
-                    'mailer' => $mailer,
-                    'status' => 'unhealthy',
-                    'error' => $e->getMessage(),
-                    'checked_at' => now()->toISOString(),
-                ];
-            }
-        }
-
-        return $results;
-    }
-
-    /**
-     * Calculate health check summary.
-     */
-    protected function calculateSummary(array &$results): void
-    {
-        $total = 0;
-        $healthy = 0;
-        $unhealthy = 0;
-
-        foreach ($results['services'] as $serviceType => $services) {
-            foreach ($services as $service) {
-                $total++;
-                if ($service['status'] === 'healthy') {
-                    $healthy++;
-                } else {
-                    $unhealthy++;
-                }
-            }
-        }
-
-        $results['summary'] = [
-            'total' => $total,
-            'healthy' => $healthy,
-            'unhealthy' => $unhealthy,
-        ];
-
-        // Set overall status
-        $results['status'] = $unhealthy === 0 ? 'healthy' : 'degraded';
-        if ($healthy === 0 && $total > 0) {
-            $results['status'] = 'unhealthy';
         }
     }
 
@@ -263,20 +79,261 @@ final class HealthCheckManager
     }
 
     /**
+     * Initialize results array with default structure.
+     */
+    private function initializeResults(): array
+    {
+        return [
+            'status' => self::HEALTH_STATUS_HEALTHY,
+            'timestamp' => now()->toISOString(),
+            'services' => [],
+            'summary' => [
+                'total' => 0,
+                'healthy' => 0,
+                'unhealthy' => 0,
+            ],
+        ];
+    }
+
+    /**
+     * Get enabled services from configuration.
+     */
+    private function getEnabledServices(): array
+    {
+        return $this->config->get('smart-failover.health_check.services', []);
+    }
+
+    /**
+     * Check specific service health.
+     */
+    private function checkService(string $service, array $config): array
+    {
+        return match ($service) {
+            'database' => app(DatabaseFailoverManager::class)->checkHealth($config),
+            'cache' => app(CacheFailoverManager::class)->checkHealth($config),
+            'queue' => app(QueueFailoverManager::class)->checkHealth($config),
+            'storage' => $this->checkStorageHealth(),
+            'mail' => $this->checkMailHealth(),
+            default => [],
+        };
+    }
+
+    /**
+     * Check storage health.
+     */
+    private function checkStorageHealth(): array
+    {
+        $results = [];
+        $disks = $this->getStorageDisks();
+
+        foreach ($disks as $disk) {
+            $results[$disk] = $this->testDiskHealth($disk);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Get storage disks to check.
+     */
+    private function getStorageDisks(): array
+    {
+        $defaultDisks = ['local', 'public'];
+        $configuredDisks = array_keys($this->config->get('filesystems.disks', []));
+        
+        return array_unique([...$defaultDisks, ...$configuredDisks]);
+    }
+
+    /**
+     * Test individual disk health.
+     */
+    private function testDiskHealth(string $disk): array
+    {
+        $startTime = microtime(true);
+        
+        try {
+            $isHealthy = $this->performDiskTest($disk);
+            $responseTime = $this->calculateResponseTime($startTime);
+
+            return [
+                'disk' => $disk,
+                'status' => $isHealthy ? self::HEALTH_STATUS_HEALTHY : self::HEALTH_STATUS_UNHEALTHY,
+                'response_time_ms' => round($responseTime, 2),
+                'checked_at' => now()->toISOString(),
+            ];
+        } catch (Exception $e) {
+            return [
+                'disk' => $disk,
+                'status' => self::HEALTH_STATUS_UNHEALTHY,
+                'error' => $e->getMessage(),
+                'checked_at' => now()->toISOString(),
+            ];
+        }
+    }
+
+    /**
+     * Perform actual disk health test.
+     */
+    private function performDiskTest(string $disk): bool
+    {
+        $testFile = 'smart_failover_health_check_' . time() . '.txt';
+        $testContent = 'health check test';
+
+        Storage::disk($disk)->put($testFile, $testContent);
+        $retrieved = Storage::disk($disk)->get($testFile);
+        Storage::disk($disk)->delete($testFile);
+
+        return $retrieved === $testContent;
+    }
+
+    /**
+     * Check mail health.
+     */
+    private function checkMailHealth(): array
+    {
+        $results = [];
+        $mailers = $this->getMailers();
+
+        foreach ($mailers as $mailer) {
+            $results[$mailer] = $this->testMailerHealth($mailer);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Get mailers to check.
+     */
+    private function getMailers(): array
+    {
+        $defaultMailers = ['smtp', 'log'];
+        $configuredMailers = array_keys($this->config->get('mail.mailers', []));
+        
+        return array_unique([...$defaultMailers, ...$configuredMailers]);
+    }
+
+    /**
+     * Test individual mailer health.
+     */
+    private function testMailerHealth(string $mailer): array
+    {
+        $startTime = microtime(true);
+        
+        try {
+            $mailerConfig = $this->config->get("mail.mailers.{$mailer}");
+            
+            if (!$mailerConfig) {
+                throw new Exception('Mailer configuration not found');
+            }
+
+            $responseTime = $this->calculateResponseTime($startTime);
+
+            return [
+                'mailer' => $mailer,
+                'status' => self::HEALTH_STATUS_HEALTHY,
+                'response_time_ms' => round($responseTime, 2),
+                'checked_at' => now()->toISOString(),
+            ];
+        } catch (Exception $e) {
+            return [
+                'mailer' => $mailer,
+                'status' => self::HEALTH_STATUS_UNHEALTHY,
+                'error' => $e->getMessage(),
+                'checked_at' => now()->toISOString(),
+            ];
+        }
+    }
+
+    /**
+     * Calculate response time in milliseconds.
+     */
+    private function calculateResponseTime(float $startTime): float
+    {
+        return (microtime(true) - $startTime) * 1000.0;
+    }
+
+    /**
+     * Check manager service health.
+     */
+    private function checkManagerHealth(string $service): bool
+    {
+        $manager = app(match ($service) {
+            'database' => DatabaseFailoverManager::class,
+            'cache' => CacheFailoverManager::class,
+            'queue' => QueueFailoverManager::class,
+        });
+
+        $status = $manager->getHealthStatus();
+        
+        return !empty($status) && in_array(true, $status, true);
+    }
+
+    /**
+     * Calculate health check summary.
+     */
+    private function calculateSummary(array &$results): void
+    {
+        $total = 0;
+        $healthy = 0;
+
+        foreach ($results['services'] as $services) {
+            foreach ($services as $service) {
+                $total++;
+                if ($service['status'] === self::HEALTH_STATUS_HEALTHY) {
+                    $healthy++;
+                }
+            }
+        }
+
+        $unhealthy = $total - $healthy;
+        
+        $results['summary'] = compact('total', 'healthy', 'unhealthy');
+        $results['status'] = $this->determineOverallStatus($total, $healthy, $unhealthy);
+    }
+
+    /**
+     * Determine overall health status.
+     */
+    private function determineOverallStatus(int $total, int $healthy, int $unhealthy): string
+    {
+        if ($unhealthy === 0) {
+            return self::HEALTH_STATUS_HEALTHY;
+        }
+        
+        if ($healthy === 0 && $total > 0) {
+            return self::HEALTH_STATUS_UNHEALTHY;
+        }
+        
+        return self::HEALTH_STATUS_DEGRADED;
+    }
+
+    /**
+     * Log health check results.
+     */
+    private function logHealthCheck(array $results): void
+    {
+        $this->logger->info('Health check completed', [
+            'status' => $results['status'],
+            'summary' => $results['summary'],
+        ]);
+    }
+
+    /**
      * Get package version.
      */
-    protected function getPackageVersion(): string
+    private function getPackageVersion(): string
     {
         try {
             $composerPath = __DIR__ . '/../../composer.json';
+            
             if (file_exists($composerPath)) {
-                $composer = json_decode(file_get_contents($composerPath), true);
-                return $composer['version'] ?? '1.0.0';
+                $composer = json_decode(file_get_contents($composerPath), true, 512, JSON_THROW_ON_ERROR);
+                return $composer['version'] ?? self::PACKAGE_VERSION;
             }
-        } catch (\Exception $e) {
-            // Ignore errors
+        } catch (Throwable $e) {
+            // Ignore errors and return default version
         }
 
-        return '1.0.0';
+        return self::PACKAGE_VERSION;
     }
 }
