@@ -17,28 +17,31 @@ use Mirzaaghazadeh\SmartFailover\Http\Controllers\HealthController;
 $routePath = config('smart-failover.health_check.route_path', '/health/smart-failover');
 $middleware = config('smart-failover.health_check.middleware', ['web']);
 
-Route::middleware($middleware)->group(function () use ($routePath) {
-    // Main health check endpoint
-    Route::get($routePath, [HealthController::class, 'index'])
-        ->name('smart-failover.health');
-    
-    // Detailed health check with service breakdown
-    Route::get($routePath . '/detailed', [HealthController::class, 'detailed'])
-        ->name('smart-failover.health.detailed');
-    
-    // Individual service health checks
-    Route::get($routePath . '/database', [HealthController::class, 'database'])
-        ->name('smart-failover.health.database');
-    
-    Route::get($routePath . '/cache', [HealthController::class, 'cache'])
-        ->name('smart-failover.health.cache');
-    
-    Route::get($routePath . '/queue', [HealthController::class, 'queue'])
-        ->name('smart-failover.health.queue');
-    
-    Route::get($routePath . '/storage', [HealthController::class, 'storage'])
-        ->name('smart-failover.health.storage');
-    
-    Route::get($routePath . '/mail', [HealthController::class, 'mail'])
-        ->name('smart-failover.health.mail');
-});
+Route::middleware($middleware)
+    ->name('smart-failover.health.')
+    ->prefix($routePath)
+    ->group(function () {
+        // Main health check endpoint
+        Route::get('/', [HealthController::class, 'index'])
+            ->name('index');
+        
+        // Detailed health check with service breakdown
+        Route::get('/detailed', [HealthController::class, 'detailed'])
+            ->name('detailed');
+        
+        // Individual service health checks
+        Route::get('/database', [HealthController::class, 'database'])
+            ->name('database');
+        
+        Route::get('/cache', [HealthController::class, 'cache'])
+            ->name('cache');
+        
+        Route::get('/queue', [HealthController::class, 'queue'])
+            ->name('queue');
+        
+        Route::get('/storage', [HealthController::class, 'storage'])
+            ->name('storage');
+        
+        Route::get('/mail', [HealthController::class, 'mail'])
+            ->name('mail');
+    });
