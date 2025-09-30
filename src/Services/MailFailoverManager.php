@@ -8,24 +8,22 @@ use Illuminate\Contracts\Mail\Mailer;
 use Illuminate\Mail\MailManager;
 use Illuminate\Support\Facades\Mail;
 use Psr\Log\LoggerInterface;
+use Throwable;
 
 final class MailFailoverManager
 {
-    protected Config $config;
-    protected LoggerInterface $logger;
-    protected MailManager $mailManager;
-    protected array $mailers = [];
-    protected ?string $primaryMailer = null;
-    protected array $fallbackMailers = [];
-    protected array $healthStatus = [];
-    protected int $retryAttempts = 3;
-    protected int $retryDelay = 1000; // milliseconds
+    private const DEFAULT_RETRY_ATTEMPTS = 3;
+    private const DEFAULT_RETRY_DELAY_MS = 1000;
+    private const HEALTH_STATUS_HEALTHY = 'healthy';
+    private const HEALTH_STATUS_UNHEALTHY = 'unhealthy';
+    private const HEALTH_CHECK_TTL = 300; // 5 minutes
+    private const SMTP_REQUIRED_KEYS = ['host', 'port'];
 
-    public function __construct(Config $config, LoggerInterface $logger, MailManager $mailManager)
-    {
-        $this->config = $config;
-        $this->logger = $logger;
-        $this->mailManager = $mailManager;
+    public function __construct(
+        private readonly Config $config,
+        private readonly LoggerInterface $logger,
+        private readonly MailManager $mailManager
+    ) {
         $this->loadConfiguration();
     }
 
@@ -36,7 +34,7 @@ final class MailFailoverManager
     {
         $this->primaryMailer = $primary;
         $this->fallbackMailers = $fallbacks;
-        $this->mailers = array_merge([$primary], $fallbacks);
+        $this->mailers = [$primary, ...$fallbacks];
 
         return $this;
     }
@@ -44,35 +42,22 @@ final class MailFailoverManager
     /**
      * Send mail with failover protection.
      */
-    public function send($mailable, $callback = null): bool
+    public function send(mixed $mailable, ?callable $callback = null): bool
     {
-        $mailers = $this->getAvailableMailers();
-
-        foreach ($mailers as $mailerName) {
+        foreach ($this->getAvailableMailers() as $mailerName) {
             try {
                 $this->logger->info("Attempting to send mail via {$mailerName}");
 
-                // Switch to the mailer
                 $this->switchToMailer($mailerName);
-
-                // Send the mail
-                if ($callback && is_callable($callback)) {
-                    $result = $callback($this->mailManager->mailer($mailerName));
-                } else {
-                    Mail::mailer($mailerName)->send($mailable);
-                    $result = true;
-                }
+                $result = $this->executeMailOperation($mailerName, $mailable, $callback);
 
                 $this->markMailerHealthy($mailerName);
                 $this->logger->info("Mail sent successfully via {$mailerName}");
 
-                return $result !== false;
+                return $result;
 
-            } catch (Exception $e) {
-                $this->markMailerUnhealthy($mailerName, $e->getMessage());
-                $this->logger->error("Mail failed via {$mailerName}: " . $e->getMessage());
-
-                // Continue to next mailer
+            } catch (Throwable $e) {
+                $this->handleMailerError($mailerName, $e, 'Mail failed');
                 continue;
             }
         }
@@ -82,46 +67,58 @@ final class MailFailoverManager
     }
 
     /**
+     * Execute mail operation with proper callback handling.
+     */
+    private function executeMailOperation(string $mailerName, mixed $mailable, ?callable $callback): bool
+    {
+        if ($callback) {
+            $result = $callback($this->mailManager->mailer($mailerName));
+            return $result !== false;
+        }
+
+        Mail::mailer($mailerName)->send($mailable);
+        return true;
+    }
+
+    /**
      * Queue mail with failover protection.
      */
-    public function queue($mailable, $queue = null): bool
+    public function queue(mixed $mailable, ?string $queue = null): bool
     {
-        $mailers = $this->getAvailableMailers();
-
-        foreach ($mailers as $mailerName) {
+        foreach ($this->getAvailableMailers() as $mailerName) {
             try {
                 $this->logger->info("Attempting to queue mail via {$mailerName}");
 
-                // Switch to the mailer
                 $this->switchToMailer($mailerName);
-
-                // Queue the mail
-                if ($queue) {
-                    /** @var \Illuminate\Mail\Mailer $mailer */
-                    $mailer = Mail::mailer($mailerName);
-                    $mailer->queue($mailable, $queue);
-                } else {
-                    /** @var \Illuminate\Mail\Mailer $mailer */
-                    $mailer = Mail::mailer($mailerName);
-                    $mailer->queue($mailable);
-                }
+                $this->executeQueueOperation($mailerName, $mailable, $queue);
 
                 $this->markMailerHealthy($mailerName);
                 $this->logger->info("Mail queued successfully via {$mailerName}");
 
                 return true;
 
-            } catch (Exception $e) {
-                $this->markMailerUnhealthy($mailerName, $e->getMessage());
-                $this->logger->error("Mail queue failed via {$mailerName}: " . $e->getMessage());
-
-                // Continue to next mailer
+            } catch (Throwable $e) {
+                $this->handleMailerError($mailerName, $e, 'Mail queue failed');
                 continue;
             }
         }
 
         $this->logger->error('All mail services failed for queuing');
         throw new Exception('All configured mail services are unavailable for queuing');
+    }
+
+    /**
+     * Execute queue operation.
+     */
+    private function executeQueueOperation(string $mailerName, mixed $mailable, ?string $queue): void
+    {
+        $mailer = Mail::mailer($mailerName);
+
+        if ($queue) {
+            $mailer->queue($mailable, $queue);
+        } else {
+            $mailer->queue($mailable);
+        }
     }
 
     /**
@@ -141,46 +138,30 @@ final class MailFailoverManager
     /**
      * Check health of a specific mailer.
      */
-    protected function checkMailerHealth(string $mailerName): array
+    private function checkMailerHealth(string $mailerName): array
     {
         $startTime = microtime(true);
 
         try {
-            // Get mailer configuration
-            $mailerConfig = $this->config->get("mail.mailers.{$mailerName}");
+            $mailerConfig = $this->getMailerConfig($mailerName);
+            $this->validateMailerConfiguration($mailerName, $mailerConfig);
+            
+            $this->mailManager->mailer($mailerName); // Test mailer instantiation
 
-            if (!$mailerConfig) {
-                throw new Exception("Mailer {$mailerName} not configured");
-            }
-
-            // Try to get the mailer instance (this will test configuration)
-            $mailer = $this->mailManager->mailer($mailerName);
-
-            // For SMTP, we could test the connection
-            if ($mailerConfig['transport'] === 'smtp') {
-                // Basic configuration validation
-                $requiredKeys = ['host', 'port'];
-                foreach ($requiredKeys as $key) {
-                    if (empty($mailerConfig[$key])) {
-                        throw new Exception("Missing required SMTP configuration: {$key}");
-                    }
-                }
-            }
-
-            $responseTime = round(((float) microtime(true) - (float) $startTime) * 1000.0, 2);
+            $responseTime = $this->calculateResponseTime($startTime);
 
             return [
-                'status' => 'healthy',
+                'status' => self::HEALTH_STATUS_HEALTHY,
                 'response_time' => $responseTime,
                 'transport' => $mailerConfig['transport'] ?? 'unknown',
                 'last_checked' => now()->toISOString(),
             ];
 
-        } catch (Exception $e) {
-            $responseTime = round(((float) microtime(true) - (float) $startTime) * 1000.0, 2);
+        } catch (Throwable $e) {
+            $responseTime = $this->calculateResponseTime($startTime);
 
             return [
-                'status' => 'unhealthy',
+                'status' => self::HEALTH_STATUS_UNHEALTHY,
                 'response_time' => $responseTime,
                 'error' => $e->getMessage(),
                 'last_checked' => now()->toISOString(),
@@ -189,9 +170,53 @@ final class MailFailoverManager
     }
 
     /**
+     * Get mailer configuration.
+     */
+    private function getMailerConfig(string $mailerName): array
+    {
+        $mailerConfig = $this->config->get("mail.mailers.{$mailerName}");
+
+        if (!$mailerConfig) {
+            throw new Exception("Mailer {$mailerName} not configured");
+        }
+
+        return $mailerConfig;
+    }
+
+    /**
+     * Validate mailer configuration.
+     */
+    private function validateMailerConfiguration(string $mailerName, array $mailerConfig): void
+    {
+        if (($mailerConfig['transport'] ?? '') === 'smtp') {
+            $this->validateSmtpConfiguration($mailerConfig);
+        }
+    }
+
+    /**
+     * Validate SMTP configuration.
+     */
+    private function validateSmtpConfiguration(array $mailerConfig): void
+    {
+        foreach (self::SMTP_REQUIRED_KEYS as $key) {
+            if (empty($mailerConfig[$key])) {
+                throw new Exception("Missing required SMTP configuration: {$key}");
+            }
+        }
+    }
+
+    /**
+     * Calculate response time in milliseconds.
+     */
+    private function calculateResponseTime(float $startTime): float
+    {
+        return round((microtime(true) - $startTime) * 1000.0, 2);
+    }
+
+    /**
      * Get available mailers in priority order.
      */
-    protected function getAvailableMailers(): array
+    private function getAvailableMailers(): array
     {
         $available = [];
 
@@ -207,18 +232,14 @@ final class MailFailoverManager
             }
         }
 
-        // If no healthy mailers, try all configured mailers
-        if (empty($available)) {
-            $available = $this->mailers;
-        }
-
-        return $available;
+        // If no healthy mailers, try all configured mailers as last resort
+        return empty($available) ? $this->mailers : $available;
     }
 
     /**
      * Switch to a specific mailer.
      */
-    protected function switchToMailer(string $mailerName): void
+    private function switchToMailer(string $mailerName): void
     {
         // Set the default mailer
         $this->config->set('mail.default', $mailerName);
@@ -230,7 +251,7 @@ final class MailFailoverManager
     /**
      * Check if mailer is healthy.
      */
-    protected function isMailerHealthy(string $mailerName): bool
+    private function isMailerHealthy(string $mailerName): bool
     {
         if (!isset($this->healthStatus[$mailerName])) {
             return true; // Assume healthy if not checked yet
@@ -238,22 +259,21 @@ final class MailFailoverManager
 
         $status = $this->healthStatus[$mailerName];
 
-        // Consider unhealthy if last failure was recent (within 5 minutes)
-        if ($status['status'] === 'unhealthy') {
+        if ($status['status'] === self::HEALTH_STATUS_UNHEALTHY) {
             $lastFailure = $status['last_failure'] ?? 0;
-            return (time() - $lastFailure) > 300; // 5 minutes
+            return (time() - $lastFailure) > self::HEALTH_CHECK_TTL;
         }
 
-        return $status['status'] === 'healthy';
+        return $status['status'] === self::HEALTH_STATUS_HEALTHY;
     }
 
     /**
      * Mark mailer as healthy.
      */
-    protected function markMailerHealthy(string $mailerName): void
+    private function markMailerHealthy(string $mailerName): void
     {
         $this->healthStatus[$mailerName] = [
-            'status' => 'healthy',
+            'status' => self::HEALTH_STATUS_HEALTHY,
             'last_success' => time(),
         ];
     }
@@ -261,42 +281,40 @@ final class MailFailoverManager
     /**
      * Mark mailer as unhealthy.
      */
-    protected function markMailerUnhealthy(string $mailerName, string $error): void
+    private function markMailerUnhealthy(string $mailerName, string $error): void
     {
         $this->healthStatus[$mailerName] = [
-            'status' => 'unhealthy',
+            'status' => self::HEALTH_STATUS_UNHEALTHY,
             'last_failure' => time(),
             'error' => $error,
         ];
     }
 
     /**
+     * Handle mailer error with consistent logging and marking.
+     */
+    private function handleMailerError(string $mailerName, Throwable $e, string $context): void
+    {
+        $this->markMailerUnhealthy($mailerName, $e->getMessage());
+        $this->logger->error("{$context} via {$mailerName}: " . $e->getMessage());
+    }
+
+    /**
      * Load configuration.
      */
-    protected function loadConfiguration(): void
+    private function loadConfiguration(): void
     {
         $config = $this->config->get('smart-failover.mail', []);
 
-        if (isset($config['primary'])) {
-            $this->primaryMailer = $config['primary'];
-        }
+        $this->primaryMailer = $config['primary'] ?? null;
+        $this->fallbackMailers = $config['fallbacks'] ?? [];
+        $this->retryAttempts = $config['retry_attempts'] ?? self::DEFAULT_RETRY_ATTEMPTS;
+        $this->retryDelay = $config['retry_delay'] ?? self::DEFAULT_RETRY_DELAY_MS;
 
-        if (isset($config['fallbacks'])) {
-            $this->fallbackMailers = $config['fallbacks'];
-        }
-
-        if (isset($config['retry_attempts'])) {
-            $this->retryAttempts = $config['retry_attempts'];
-        }
-
-        if (isset($config['retry_delay'])) {
-            $this->retryDelay = $config['retry_delay'];
-        }
-
-        $this->mailers = array_merge(
-            $this->primaryMailer ? [$this->primaryMailer] : [],
-            $this->fallbackMailers
-        );
+        $this->mailers = array_filter([
+            $this->primaryMailer,
+            ...$this->fallbackMailers
+        ]);
     }
 
     /**
@@ -306,9 +324,40 @@ final class MailFailoverManager
     {
         return [
             'primary' => $this->primaryMailer,
-            'fallbacks' => $this->fallbackMailers,
+            'fallbacks' => $this->fallbackDisks,
             'health' => $this->healthStatus,
             'available_mailers' => $this->getAvailableMailers(),
         ];
+    }
+
+    /**
+     * Get statistics about mail operations.
+     */
+    public function getStatistics(): array
+    {
+        $stats = [
+            'total_mailers' => count($this->mailers),
+            'healthy_mailers' => 0,
+            'unhealthy_mailers' => 0,
+            'mailers' => [],
+        ];
+
+        foreach ($this->mailers as $mailerName) {
+            $isHealthy = $this->isMailerHealthy($mailerName);
+            
+            if ($isHealthy) {
+                $stats['healthy_mailers']++;
+            } else {
+                $stats['unhealthy_mailers']++;
+            }
+
+            $stats['mailers'][$mailerName] = [
+                'healthy' => $isHealthy,
+                'is_primary' => $mailerName === $this->primaryMailer,
+                'is_fallback' => in_array($mailerName, $this->fallbackMailers, true),
+            ];
+        }
+
+        return $stats;
     }
 }
